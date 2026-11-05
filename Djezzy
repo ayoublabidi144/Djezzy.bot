@@ -1,32 +1,447 @@
-def request_otp(phone):
-    params = {
-        "msisdn": phone,
-        "client_id": APP_CLIENT_ID,
-        "scope": "smsotp",
+# -*- coding: utf-8 -*-
+"""
+Djezzy Assistant Telegram Bot (Render Web Services Edition)
+"""
+
+import os
+import re
+import logging
+import asyncio
+from datetime import date
+
+import requests
+from flask import Flask, request as flask_request
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters,
+)
+
+BASE = "https://apim.djezzy.dz/mobile-api"
+API = BASE + "/api/v1"
+CONTENT_API = BASE + "/content/api/v1"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9055838860:AAFLVIu6WCEhiX39hilOWzZOclXD5-gzwfc")
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+DJZ_CLIENT_ID = "87pIExRhxBb3_wGsA5eSEfyATloa"
+DJZ_CLIENT_SECRET = "uf82p68Bgisp8Yg1Uz8Pf6_v1XYa"
+
+APP_CLIENT_ID = os.getenv("APP_CLIENT_ID", DJZ_CLIENT_ID).strip()
+APP_CLIENT_SECRET = os.getenv("APP_CLIENT_SECRET", DJZ_CLIENT_SECRET).strip()
+
+UA = "MobileApp/3.0.0"
+TIMEOUT = 25
+MAX_INVITES_PER_DAY = 5
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("djezzy_bot")
+
+sessions = {}
+pending_actions = {}
+daily_usage = {"date": date.today(), "count": 0}
+
+flask_app = Flask(__name__)
+
+
+def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("🔐 تسجيل الدخول"), KeyboardButton("🚪 تسجيل الخروج")],
+        [KeyboardButton("💰 الرصيد"), KeyboardButton("📦 الباقات النشطة")],
+        [KeyboardButton("🧾 سجل الاشتراكات"), KeyboardButton("🎁 الكتالوج")],
+        [KeyboardButton("🎲 هز واربح"), KeyboardButton("🚶 امشي واربح")],
+        [KeyboardButton("📨 إرسال دعوة"), KeyboardButton("📋 سجل الدعوات")],
+        [KeyboardButton("🧩 الخدمات الرقمية")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def normalize_phone(value):
+    digits = re.sub(r"\D", "", str(value))
+    if digits.startswith("0") and len(digits) == 10:
+        digits = "213" + digits[1:]
+    elif len(digits) == 9 and digits[0] in "567":
+        digits = "213" + digits
+    if not re.fullmatch(r"213[567]\d{8}", digits):
+        raise ValueError("أدخل رقم جازي صحيحاً، مثال: 0770123456")
+    return digits
+
+
+def form_headers(token=None):
+    h = {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
-    consent = {
-        "consent-agreement": [{"marketing-notifications": False}],
-        "is-consent": True,
-    }
-    headers = {
-        "User-Agent": "MobileApp/3.0.0",
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+def json_headers(token):
+    return {
+        "User-Agent": UA,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "accept-language": "fr",
+        "Accept-Language": "ar",
+        "Authorization": f"Bearer {token}",
     }
+
+
+def request_otp(phone):
+    params = {"msisdn": phone, "client_id": APP_CLIENT_ID, "scope": "smsotp"}
+    consent = {"consent-agreement": [{"marketing-notifications": False}], "is-consent": True}
+    headers = {"User-Agent": "MobileApp/3.0.0", "Accept": "application/json", "Content-Type": "application/json", "accept-language": "fr"}
     try:
-        response = requests.post(
-            BASE + "/oauth2/registration",
-            params=params,
-            json=consent,
-            headers=headers,
-            timeout=TIMEOUT,
-        )
+        response = requests.post(BASE + "/oauth2/registration", params=params, json=consent, headers=headers, timeout=TIMEOUT)
     except requests.RequestException as exc:
         raise RuntimeError(f"خطأ في الشبكة: {exc}") from exc
 
-    # طباعة واسترجاع سبب الرفض الحقيقي من جازي
     if response.status_code not in (200, 201, 202):
         detail = response.text[:400]
         raise RuntimeError(f"رفض جازي (HTTP {response.status_code}): {detail}")
     return None
+
+
+def verify_otp(phone, otp, token=None):
+    r = requests.post(
+        BASE + "/oauth2/token",
+        headers=form_headers(),
+        data={
+            "grant_type": "mobile", "mobileNumber": phone, "otp": otp,
+            "client_id": APP_CLIENT_ID, "client_secret": APP_CLIENT_SECRET, "scope": "djezzyAppV2",
+        },
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def refresh_session(user):
+    if not user.get("refresh_token"):
+        return False
+    r = requests.post(
+        BASE + "/oauth2/token",
+        headers=form_headers(),
+        data={
+            "grant_type": "refresh_token", "refresh_token": user["refresh_token"],
+            "client_id": APP_CLIENT_ID, "client_secret": APP_CLIENT_SECRET, "scope": "djezzyAppV2",
+        },
+        timeout=TIMEOUT,
+    )
+    if r.status_code != 200:
+        return False
+    data = r.json()
+    user["access_token"] = data["access_token"]
+    user["refresh_token"] = data.get("refresh_token", user["refresh_token"])
+    return True
+
+
+def api_request(user, method, path, *, content=False, **kwargs):
+    root = CONTENT_API if content else API
+    url = root + path
+    r = requests.request(method, url, headers=json_headers(user["access_token"]), timeout=TIMEOUT, **kwargs)
+    if r.status_code == 401 and refresh_session(user):
+        r = requests.request(method, url, headers=json_headers(user["access_token"]), timeout=TIMEOUT, **kwargs)
+    if r.status_code == 402 and "/services/shake/" in path:
+        try:
+            return r.json()
+        except ValueError:
+            return {"status": 402, "message": "تم قبول طلب التفعيل."}
+    r.raise_for_status()
+    if not r.text.strip():
+        return {}
+    try:
+        return r.json()
+    except ValueError:
+        return {"raw": r.text[:1000]}
+
+
+def data_of(result):
+    return result.get("data", {}) if isinstance(result, dict) else {}
+
+
+def lang_name(value):
+    if isinstance(value, dict):
+        return value.get("ar") or value.get("fr") or value.get("en") or "غير متوفر"
+    return value if value is not None else "غير متوفر"
+
+
+async def guard(update):
+    return True
+
+
+def get_user(update):
+    return sessions.get(update.effective_user.id)
+
+
+async def send_error(message, exc):
+    if isinstance(exc, requests.HTTPError):
+        code = exc.response.status_code if exc.response is not None else "?"
+        text = f"رفض خادم جازي الطلب. HTTP {code}."
+    elif isinstance(exc, requests.RequestException):
+        text = "تعذر الاتصال بخادم جازي."
+    else:
+        text = f"خطأ: {str(exc)}"
+    await message.reply_text(text[:400])
+
+
+def menu_text():
+    return (
+        "🤖 مساعد جازي\n\n"
+        "اختر من الأزرار أدناه 👇\n"
+        "ملاحظة: توفر العروض والمكافآت يحدده حسابك وخادم جازي."
+    )
+
+
+async def start(update, context):
+    if await guard(update):
+        await update.message.reply_text(menu_text(), reply_markup=get_main_keyboard())
+
+
+async def login(update, context):
+    if not await guard(update):
+        return
+    context.user_data.clear()
+    context.user_data["state"] = "phone"
+    await update.message.reply_text("أرسل رقم جازي الخاص بك، مثال: 0770123456", reply_markup=get_main_keyboard())
+
+
+async def logout(update, context):
+    if not await guard(update):
+        return
+    sessions.pop(update.effective_user.id, None)
+    context.user_data.clear()
+    pending_actions.pop(update.effective_user.id, None)
+    await update.message.reply_text("تم تسجيل الخروج ومسح الجلسة.", reply_markup=get_main_keyboard())
+
+
+async def balance(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        result = data_of(api_request(user, "GET", f"/subscribers/main-balance/{user['phone']}"))
+        info = result.get("customerInformations", {})
+        await update.message.reply_text(
+            "💰 معلومات الرصيد والخط\n"
+            f"الرصيد: {result.get('mainBalance', 'غير متوفر')} دج\n"
+            f"حالة الخط: {info.get('status', 'غير متوفر')}"
+        )
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def packages(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        result = data_of(api_request(user, "GET", f"/subscribers/connected-products-balances/{user['phone']}"))
+        items = result.get("products", [])
+        lines = ["📦 الباقات والحصص النشطة"]
+        for item in items[:15]:
+            lines.append(f"• {lang_name(item.get('commercialName'))}")
+        if len(lines) == 1: lines.append("لا توجد باقات نشطة.")
+        await update.message.reply_text("\n".join(lines)[:4000])
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def history(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        result = data_of(api_request(user, "GET", f"/subscribers/subscription-history/{user['phone']}"))
+        if isinstance(result, dict): result = result.get("history", [])
+        lines = ["🧾 آخر الاشتراكات:"]
+        for item in result[:10] if isinstance(result, list) else []:
+            lines.append(f"• {lang_name(item.get('commercialName'))} | {item.get('status', '?')}")
+        if len(lines) == 1: lines.append("لا يوجد سجل.")
+        await update.message.reply_text("\n".join(lines)[:4000])
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def shake(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        result = data_of(api_request(user, "GET", f"/services/shake/{user['phone']}"))
+        code = result.get("code")
+        if not code:
+            await update.message.reply_text("لا يوجد عرض هز واربح متاح حالياً.")
+            return
+        await update.message.reply_text(f"🎲 العرض المتاح: {lang_name(result.get('commercialName'))} (الكود: {code})")
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def walk(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        result = data_of(api_request(user, "GET", f"/services/walk/campaign/{user['phone']}"))
+        await update.message.reply_text("🚶 تم فحص حملة امشي واربح بنجاح.")
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def invite(update, context):
+    if not await guard(update): return
+    if not await need_user(update): return
+    context.user_data["state"] = "invite_phone"
+    await update.message.reply_text("أرسل رقم الشخص لدعوته:")
+
+
+async def invitations(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        result = data_of(api_request(user, "GET", f"/services/mgm/invitations/{user['phone']}"))
+        await update.message.reply_text("📋 تم جلب سجل الدعوات.")
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def catalog(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        result = data_of(api_request(user, "GET", f"/subscribers/customer-offers/{user['phone']}", params={"tags": "STANDARD"}))
+        await update.message.reply_text("🎁 تم جلب كتالوج العروض.")
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def services(update, context):
+    if not await guard(update): return
+    user = await need_user(update)
+    if not user: return
+    try:
+        await update.message.reply_text("🧩 الخدمات الرقمية متاحة.")
+    except Exception as exc: await send_error(update.message, exc)
+
+
+async def callback(update, context):
+    q = update.callback_query
+    await q.answer()
+
+
+async def need_user(update):
+    user = get_user(update)
+    if not user:
+        await update.effective_message.reply_text("سجّل الدخول أولاً باستعمال /login.")
+        return None
+    return user
+
+
+async def handle_text(update, context):
+    if not await guard(update):
+        return
+    text = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    state = context.user_data.get("state")
+
+    # التعامل مع الضغط على الأزرار الثابتة
+    if text == "🔐 تسجيل الدخول":
+        return await login(update, context)
+    elif text == "🚪 تسجيل الخروج":
+        return await logout(update, context)
+    elif text == "💰 الرصيد":
+        return await balance(update, context)
+    elif text == "📦 الباقات النشطة":
+        return await packages(update, context)
+    elif text == "🧾 سجل الاشتراكات":
+        return await history(update, context)
+    elif text == "🎁 الكتالوج":
+        return await catalog(update, context)
+    elif text == "🎲 هز واربح":
+        return await shake(update, context)
+    elif text == "🚶 امشي واربح":
+        return await walk(update, context)
+    elif text == "📨 إرسال دعوة":
+        return await invite(update, context)
+    elif text == "📋 سجل الدعوات":
+        return await invitations(update, context)
+    elif text == "🧩 الخدمات الرقمية":
+        return await services(update, context)
+
+    if state == "phone":
+        try:
+            phone = normalize_phone(text)
+            token = request_otp(phone)
+            context.user_data.update({"login_phone": phone, "public_token": token, "state": "otp"})
+            await update.message.reply_text("📩 طلبت رمز التحقق لرقمك. أرسل رمز OTP هنا:")
+        except Exception as exc:
+            await send_error(update.message, exc)
+        return
+
+    if state == "otp":
+        if not re.fullmatch(r"\d{4,8}", text):
+            await update.message.reply_text("رمز OTP يجب أن يتكون من أرقام فقط.")
+            return
+        try:
+            phone = context.user_data["login_phone"]
+            tokens = verify_otp(phone, text, context.user_data.get("public_token"))
+            sessions[uid] = {
+                "phone": phone,
+                "access_token": tokens["access_token"],
+                "refresh_token": tokens.get("refresh_token"),
+            }
+            context.user_data.clear()
+            await update.message.reply_text("✅ تم تسجيل الدخول بنجاح!", reply_markup=get_main_keyboard())
+        except Exception as exc:
+            context.user_data.clear()
+            await send_error(update.message, exc)
+        return
+
+    await update.message.reply_text("استخدم الأزرار أدناه أو اكتب /start", reply_markup=get_main_keyboard())
+
+
+application = Application.builder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("login", login))
+application.add_handler(CommandHandler("logout", logout))
+application.add_handler(CommandHandler("balance", balance))
+application.add_handler(CommandHandler("packages", packages))
+application.add_handler(CommandHandler("history", history))
+application.add_handler(CommandHandler("shake", shake))
+application.add_handler(CommandHandler("walk", walk))
+application.add_handler(CommandHandler("invite", invite))
+application.add_handler(CommandHandler("invitations", invitations))
+application.add_handler(CommandHandler("catalog", catalog))
+application.add_handler(CommandHandler("services", services))
+application.add_handler(CallbackQueryHandler(callback))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+
+@flask_app.route("/", methods=["GET"])
+def index():
+    return "Djezzy Telegram Bot is running!", 200
+
+
+@flask_app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(flask_request.get_json(force=True), application.bot)
+    async def process():
+        await application.initialize()
+        await application.process_update(update)
+        await application.shutdown()
+    asyncio.run(process())
+    return "OK", 200
+
+
+def setup_webhook():
+    if WEBHOOK_URL:
+        full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
+        async def set_wh():
+            await application.bot.set_webhook(url=full_webhook_url)
+        asyncio.run(set_wh())
+
+
+if __name__ == "__main__":
+    setup_webhook()
+    flask_app.run(host="0.0.0.0", port=PORT)
