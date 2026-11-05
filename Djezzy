@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Djezzy Assistant Telegram Bot (Render Web Services Edition - Open Access)
-- تم إزالة قيود الحماية ليعمل البوت بشكل مباشر وسلس.
+Djezzy Assistant Telegram Bot (Render Web Services Edition - Direct Config)
 """
 
 import os
@@ -24,19 +23,16 @@ BASE = "https://apim.djezzy.dz/mobile-api"
 API = BASE + "/api/v1"
 CONTENT_API = BASE + "/content/api/v1"
 
-# قراءة المتغيرات من بيئة العمل في Render مع قيم افتراضية آمنة
+# قراءة المتغيرات مع وضع القيم الافتراضية مباشرة لمنع أي خطأ RuntimeError
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9055838860:AAFLVIu6WCEhiX39hilOWzZOclXD5-gzwfc")
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 DJZ_CLIENT_ID     = "87pIExRhxBb3_wGsA5eSEfyATloa"
 DJZ_CLIENT_SECRET = "uf82p68Bgisp8Yg1Uz8Pf6_v1XYa"
-DJZ_URL_SUBS      = "https://apim.djezzy.dz/mobile-api/api/v1/subscribers/connected-products-balances/{msisdn}"
-DJZ_PKG_CODE      = "GIFTWALKWIN2GO"
-DJZ_COOLDOWN      = 7 * 24 * 3600
 
-APP_CLIENT_ID = os.getenv("APP_CLIENT_ID", "87pIExRhxBb3_wGsA5eSEfyATloa").strip()
-APP_CLIENT_SECRET = os.getenv("APP_CLIENT_SECRET", "uf82p68Bgisp8Yg1Uz8Pf6_v1XYa").strip()
+APP_CLIENT_ID = os.getenv("APP_CLIENT_ID", DJZ_CLIENT_ID).strip()
+APP_CLIENT_SECRET = os.getenv("APP_CLIENT_SECRET", DJZ_CLIENT_SECRET).strip()
 
 UA = "MobileApp/3.0.0"
 TIMEOUT = 25
@@ -52,7 +48,6 @@ sessions = {}
 pending_actions = {}
 daily_usage = {"date": date.today(), "count": 0}
 
-# إنشاء خادم Flask لاستقبال تحديثات Webhook من تيليجرام
 flask_app = Flask(__name__)
 
 
@@ -89,8 +84,6 @@ def json_headers(token):
 
 
 def request_otp(phone):
-    if not APP_CLIENT_ID:
-        raise RuntimeError("APP_CLIENT_ID غير مضبوط.")
     params = {
         "msisdn": phone,
         "client_id": APP_CLIENT_ID,
@@ -126,8 +119,6 @@ def request_otp(phone):
 
 
 def verify_otp(phone, otp, token=None):
-    if not APP_CLIENT_ID or not APP_CLIENT_SECRET:
-        raise RuntimeError("إعدادات APP_CLIENT_ID أو APP_CLIENT_SECRET ناقصة.")
     r = requests.post(
         BASE + "/oauth2/token",
         headers=form_headers(),
@@ -205,7 +196,6 @@ def lang_name(value):
 
 
 async def guard(update):
-    # تم إلغاء تقييد الحماية ليشتغل البوت فوراً دون رسالة الخطأ
     return True
 
 
@@ -609,7 +599,6 @@ async def callback(update, context):
             await q.edit_message_text("تعذر تنفيذ الطلب حالياً. حاول لاحقاً.")
 
 
-# إعداد تطبيق تيليجرام وربطه بالـ Handlers
 application = Application.builder().token(BOT_TOKEN).build()
 
 commands = [
@@ -631,7 +620,6 @@ def index():
 
 @flask_app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    """استقبال التحديثات من تيليجرام وإرسالها لمعالج الأخطاء والأحداث"""
     json_str = flask_request.get_data(as_text=True)
     update = Update.de_json(flask_request.get_json(force=True), application.bot)
     
@@ -660,5 +648,4 @@ if __name__ == "__main__":
         raise SystemExit("يجب ضبط BOT_TOKEN أولاً.")
     
     setup_webhook()
-    # بدء تشغيل خادم Flask
     flask_app.run(host="0.0.0.0", port=PORT)
