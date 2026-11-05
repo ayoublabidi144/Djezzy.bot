@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Djezzy Assistant Telegram Bot (Render Web Services Edition)
+Djezzy Assistant Telegram Bot (Render Web Services Edition - Anti-Timeout)
 """
 
 import os
@@ -11,7 +11,7 @@ from datetime import date
 
 import requests
 from flask import Flask, request as flask_request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters,
@@ -32,8 +32,7 @@ APP_CLIENT_ID = os.getenv("APP_CLIENT_ID", DJZ_CLIENT_ID).strip()
 APP_CLIENT_SECRET = os.getenv("APP_CLIENT_SECRET", DJZ_CLIENT_SECRET).strip()
 
 UA = "MobileApp/3.0.0"
-TIMEOUT = 25
-MAX_INVITES_PER_DAY = 5
+TIMEOUT = 35  # رفع وقت الانتظار لتجاوز مشاكل بطء الاتصال على Render
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -95,11 +94,23 @@ def json_headers(token):
 def request_otp(phone):
     params = {"msisdn": phone, "client_id": APP_CLIENT_ID, "scope": "smsotp"}
     consent = {"consent-agreement": [{"marketing-notifications": False}], "is-consent": True}
-    headers = {"User-Agent": "MobileApp/3.0.0", "Accept": "application/json", "Content-Type": "application/json", "accept-language": "fr"}
+    headers = {
+        "User-Agent": "DalilDjezzy/3.0.0 (Android)",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "accept-language": "fr",
+        "Connection": "keep-alive"
+    }
     try:
-        response = requests.post(BASE + "/oauth2/registration", params=params, json=consent, headers=headers, timeout=TIMEOUT)
+        response = requests.post(
+            BASE + "/oauth2/registration", 
+            params=params, 
+            json=consent, 
+            headers=headers, 
+            timeout=TIMEOUT
+        )
     except requests.RequestException as exc:
-        raise RuntimeError(f"خطأ في الشبكة: {exc}") from exc
+        raise RuntimeError(f"خطأ في الاتصال بشبكة جازي: {exc}") from exc
 
     if response.status_code not in (200, 201, 202):
         detail = response.text[:400]
@@ -184,7 +195,7 @@ async def send_error(message, exc):
         code = exc.response.status_code if exc.response is not None else "?"
         text = f"رفض خادم جازي الطلب. HTTP {code}."
     elif isinstance(exc, requests.RequestException):
-        text = "تعذر الاتصال بخادم جازي."
+        text = "تعذر الاتصال بخادم جازي بسبب بطء الشبكة."
     else:
         text = f"خطأ: {str(exc)}"
     await message.reply_text(text[:400])
@@ -345,7 +356,6 @@ async def handle_text(update, context):
     uid = update.effective_user.id
     state = context.user_data.get("state")
 
-    # التعامل مع الضغط على الأزرار الثابتة
     if text == "🔐 تسجيل الدخول":
         return await login(update, context)
     elif text == "🚪 تسجيل الخروج":
